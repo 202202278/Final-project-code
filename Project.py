@@ -14,9 +14,7 @@ def lm_xy(hand_landmarks, idx, w, h):
 def thumb_direction(hand_landmarks, w, h):
     """
     Returns 'up', 'down', or 'neutral' for the thumb direction.
-    Heuristic: look at the vector from THUMB_MCP -> THUMB_TIP (2 -> 4).
-    If dy is clearly negative => up, clearly positive => down.
-    We also require the thumb to be extended enough relative to hand size.
+    Uses THUMB_MCP -> THUMB_TIP vector and hand size normalization.
     """
     WRIST = mp.solutions.hands.HandLandmark.WRIST
     THUMB_MCP = mp.solutions.hands.HandLandmark.THUMB_MCP
@@ -44,7 +42,7 @@ def thumb_direction(hand_landmarks, w, h):
 
 def pointing_gesture_vertical(hand_landmarks):
     """
-    Original logic (stabilized): compare index tip vs thumb tip Y.
+    Compare index tip vs thumb tip Y.
     Returns 'pointing up', 'pointing down', or 'other'.
     """
     idx = mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP
@@ -83,17 +81,30 @@ car_volume = 50        # 0..100
 last_vol_time = 0.0
 vol_cooldown = 0.5     # seconds
 
+last_track_time = 0.0
+track_cooldown = 0.8   # seconds
+
 last_call_time = 0.0
-call_cooldown = 0.8    # seconds (accept/reject/end debounce)
+call_cooldown = 0.8    # seconds
 
 # Music mock
 tracks = ["Song A", "Song B", "Song C", "Song D"]
 current_track = 0
-last_track_time = 0.0
-track_cooldown = 0.8   # to avoid rapid skips
+
+# ---------- Gesture stability (hold-to-confirm) ----------
+GESTURE_HOLD_TIME = 1.2  # seconds to hold gesture before acting
+CALL_HOLD_TIME = 1.2     # seconds to hold thumb gesture before acting
+
+# For non-call gestures in idle state
+current_gesture = "none"         # 'vol_up', 'vol_down', 'track_left', 'track_right', 'none'
+gesture_start_time = 0.0
+
+# For call gestures in ringing/in_call states
+call_current_gesture = "none"    # 'thumb_up', 'thumb_down', 'none'
+call_gesture_start_time = 0.0
 
 # ---------- MediaPipe / Camera ----------
-cap = cv2.VideoCapture(1)  # enter your camera index, probably 0 some times 1 or 2
+cap = cv2.VideoCapture(1)  # enter your camera index
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1,
                        min_detection_confidence=0.5, min_tracking_confidence=0.5)
@@ -108,6 +119,8 @@ while True:
     frame = cv2.flip(frame, 1)  # mirror for natural interaction
     h, w = frame.shape[:2]
     image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    now = time.time()
     results = hands.process(image_rgb)
 
     gesture_text = "none"
@@ -116,57 +129,126 @@ while True:
         hand_landmarks = results.multi_hand_landmarks[0]
         mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-        # ----- Volume (vertical) — unchanged behavior, paused while ringing -----
-        if state != "ringing":
+        # ------------------ IDLE STATE: volume + track only ------------------
+        if state == "idle":
+            # We do NOT check thumb for calls here; only pointing gestures.
             g_v = pointing_gesture_vertical(hand_landmarks)
-            gesture_text = g_v
-            now = time.time()
-            if now - last_vol_time > vol_cooldown:
-                if g_v == "pointing up" and car_volume < 100:
-                    car_volume += 5
-                    last_vol_time = now
-                elif g_v == "pointing down" and car_volume > 0:
-                    car_volume -= 5
-                    last_vol_time = now
-
-        # ----- Track control (horizontal) — only when not ringing -----
-        if state != "ringing":
             g_h = pointing_gesture_horizontal(hand_landmarks)
-            # show whichever last non-'other' we saw for better feedback
-            if g_h != "other":
-                gesture_text = g_h
-            now = time.time()
-            if now - last_track_time > track_cooldown:
-                if g_h == "pointing right":
-                    current_track = (current_track + 1) % len(tracks)
-                    last_track_time = now
-                elif g_h == "pointing left":
-                    current_track = (current_track - 1) % len(tracks)
-                    last_track_time = now
 
-        # ----- Call control with thumb up/down -----
-        td = thumb_direction(hand_landmarks, w, h)
+            # Decide ONE high-level gesture (mutually exclusive)
+            # Priority: track (horizontal) > volume (vertical)
+            raw_gesture = "none"
+            if g_h == "pointing right":
+                raw_gesture = "track_right"
+            elif g_h == "pointing left":
+                raw_gesture = "track_left"
+            elif g_v == "pointing up":
+                raw_gesture = "vol_up"
+            elif g_v == "pointing down":
+                raw_gesture = "vol_down"
 
-        if state == "ringing":
-            if td in ("up", "down"):
-                gesture_text = f"thumb {td}"
-            now = time.time()
-            if now - last_call_time > call_cooldown:
-                if td == "up":
+            # Hold-to-confirm logic for non-call gestures
+            if raw_gesture != current_gesture:
+                current_gesture = raw_gesture
+                gesture_start_time = now
+
+            gesture_ready = (
+                current_gesture != "none"
+                and (now - gesture_start_time) >= GESTURE_HOLD_TIME
+            )
+
+            # Act only if gesture is stable for long enough
+            if gesture_ready:
+                # Volume control
+                if current_gesture in ("vol_up", "vol_down"):
+                    if now - last_vol_time > vol_cooldown:
+                        if current_gesture == "vol_up" and car_volume < 100:
+                            car_volume += 5
+                            last_vol_time = now
+                        elif current_gesture == "vol_down" and car_volume > 0:
+                            car_volume -= 5
+                            last_vol_time = now
+
+                # Track control
+                if current_gesture in ("track_right", "track_left"):
+                    if now - last_track_time > track_cooldown:
+                        if current_gesture == "track_right":
+                            current_track = (current_track + 1) % len(tracks)
+                            last_track_time = now
+                        elif current_gesture == "track_left":
+                            current_track = (current_track - 1) % len(tracks)
+                            last_track_time = now
+
+            # Display text for feedback (even while holding)
+            if current_gesture == "vol_up":
+                gesture_text = "volume up (holding)"
+            elif current_gesture == "vol_down":
+                gesture_text = "volume down (holding)"
+            elif current_gesture == "track_right":
+                gesture_text = "next track (holding)"
+            elif current_gesture == "track_left":
+                gesture_text = "prev track (holding)"
+            else:
+                gesture_text = "none"
+
+            # Reset call gesture state when not in call mode
+            call_current_gesture = "none"
+            call_gesture_start_time = now
+
+        # ------------------ CALL STATES: thumb only ------------------
+        elif state in ("ringing", "in_call"):
+            # Only check thumb, ignore volume & track gestures completely
+            td = thumb_direction(hand_landmarks, w, h)
+
+            # Map thumb_direction -> call gesture (up only matters when ringing)
+            if td == "up" and state == "ringing":
+                raw_call_gesture = "thumb_up"
+            elif td == "down":
+                raw_call_gesture = "thumb_down"
+            else:
+                raw_call_gesture = "none"
+
+            # Hold-to-confirm logic for call gestures
+            if raw_call_gesture != call_current_gesture:
+                call_current_gesture = raw_call_gesture
+                call_gesture_start_time = now
+
+            call_ready = (
+                call_current_gesture != "none"
+                and (now - call_gesture_start_time) >= CALL_HOLD_TIME
+            )
+
+            # Apply call logic
+            if state == "ringing" and call_ready and (now - last_call_time > call_cooldown):
+                if call_current_gesture == "thumb_up":
                     state = "in_call"
                     last_call_time = now
-                elif td == "down":
+                elif call_current_gesture == "thumb_down":
                     state = "idle"
                     last_call_time = now
 
-        elif state == "in_call":
-            # Thumb down ends the call
-            if td == "down":
-                now = time.time()
+            elif state == "in_call" and call_ready and call_current_gesture == "thumb_down":
                 if now - last_call_time > call_cooldown:
                     state = "idle"
                     last_call_time = now
-            # Thumb up in-call: no action (kept simple)
+
+            # Display gesture text
+            if call_current_gesture == "thumb_up":
+                gesture_text = "thumb up (holding)"
+            elif call_current_gesture == "thumb_down":
+                gesture_text = "thumb down (holding)"
+            else:
+                gesture_text = "none"
+
+            # Reset non-call gestures while in call modes
+            current_gesture = "none"
+            gesture_start_time = now
+
+    else:
+        # No hand detected -> treat as natural / no gesture
+        current_gesture = "none"
+        call_current_gesture = "none"
+        gesture_text = "none"
 
     # ---------- UI ----------
     # Volume bar (always visible)
@@ -203,8 +285,9 @@ while True:
     if key == ord('q'):
         break
     elif key in (ord('c'), ord('C')):
-        if state != "in_call":
+        if state != "in_call":   # only start ringing if not already in a call
             state = "ringing"
 
 cap.release()
-cv2.destroyAllWind
+cv2.destroyAllWindows()
+
